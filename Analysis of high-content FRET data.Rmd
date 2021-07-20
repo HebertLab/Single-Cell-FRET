@@ -1,0 +1,302 @@
+## Sample analysis of high-content FRET data
+## Striatal neurons transduced with AKAR-NLS and treated with vehicle (dmso), D1R agonist (SKF), or forskolin (FSK)
+### csv's exported from the main analysis script
+```{r message = FALSE}
+# Libraries required
+
+library(tidyverse)
+library(gridExtra)
+library(dtwclust)
+library(ggpubr)
+library(viridis)
+library(rstatix)
+library(knitr)
+library(RColorBrewer)
+
+#Graphics theme
+
+theme_set(theme_classic(base_size=15))
+theme_update(panel.background = element_rect(fill = "transparent", colour = NA),
+             plot.background = element_rect(fill = "transparent", colour = NA))
+opts_chunk$set(dev.args=list(bg="transparent"))
+```
+
+
+```{r}
+# Read in csv files exported by the associated pre-processing script
+
+Akar <- read.csv("/Users/jacejones-tabah/OneDrive - McGill University/Documents/SingleCell/2021-07-19 Annotated code for Github/AKAR-NLS_Sample_Data_Github.csv")
+
+
+```
+
+## dF/F processing
+
+```{r}
+# Convert delta FRET values into percent change in FRET relative to baseline
+
+dFF <- function (x){
+        baseline <- filter(x, timepoint == 1)
+        FRETbaseline <- mean(baseline$FRET1)
+        FretdFF <- x %>% 
+                mutate(df_fret = 100*(dfret / FRETbaseline))
+        return(FretdFF)
+}
+
+akar1 <- dFF(Akar)
+
+akar1 <- as_tibble(akar1) 
+
+
+## Clean and order variables
+
+akar1 <- select(akar1, -Well2)
+akar1$Treatment <- factor(akar1$Treatment, levels = c("DMSO", "SKF", "FSK"))
+
+akar1 <- akar1[order(akar1$Treatment),]%>%
+  mutate(Identifier = paste(PlateID, WellName, sep="-"))%>%
+        select(-Timepoint, -X.1, -Field, -X, -Y) %>%
+  filter(Treatment %in% c("DMSO", "SKF", "FSK"))
+
+
+```
+
+
+```{r}
+### Add roundness and shape identifiers
+akar1 <- akar1 %>%
+        group_by(Identifier, rowname) %>%
+        mutate(Nuclear_roundness = ifelse(Cell.Roundness >= 0.9 & timepoint == 1, "Round",
+                                          ifelse(Cell.Roundness <= 0.9 & timepoint == 1, "Elongated", NA)),
+               Nuclear_size = ifelse(Cell.Area.µm >= 125 & timepoint == 1, "Large",
+                                     ifelse(Cell.Area.µm <= 125 & timepoint == 1, "Medium", NA))) %>%
+        ungroup() %>%
+        group_by(rowname, Identifier) %>%
+        mutate(Nuclear_roundness = Nuclear_roundness[timepoint == 1],
+               Nuclear_size = Nuclear_size[timepoint == 1])%>%
+        ungroup()%>%
+  mutate(CellType = paste (Nuclear_size, Nuclear_roundness))
+
+akar1$Nuclear_roundness <- factor(akar1$Nuclear_roundness, levels = c("Round", "Elongated"))
+akar1 <- akar1[order(akar1$Nuclear_roundness),]
+
+akar1$Nuclear_size <- factor(akar1$Nuclear_size, levels = c("Medium", "Large"))
+akar1 <- akar1[order(akar1$Nuclear_size),]
+
+# Isolate complete cases (cells which are present in the dataset at all timepoints)
+# Remove outliers (cells with changes in FRET beyond normal range)
+# Remove cells with low fluorescence signal (CFP < 600)
+akar_complete <- akar1 %>%
+        filter(df_fret >= -20,
+               df_fret <= 60,
+               CFP.Mean >= 600) %>%
+        group_by(Identifier, rowname) %>%
+        filter (n() == 4)%>%
+        ungroup()
+
+```
+
+```{r}
+# PLot whole dataset
+
+akar_grouped <- akar_complete %>% group_by(Treatment, rowname)
+
+
+ggplot(data=akar_grouped, aes(y=df_fret, x= timepoint, group=rowname))+
+        geom_path(alpha=0.5)+
+        facet_grid(.~Treatment) +
+        scale_color_gradient(low = '#f7fefe', high = '#1d366a') +
+        theme_minimal() + 
+        theme(panel.grid.major = element_blank(), 
+              panel.background = element_rect(colour = "black", size=1))+
+        labs(title = "Complete Cases")
+
+
+```
+
+
+
+```{r}
+## Plot Summary data
+Akar_grouped <- akar_complete %>% group_by(Treatment, time)%>%
+        summarise(avg_fret = mean(df_fret), 
+                  sd_fret = sd(df_fret), 
+                  sem_fret = sd(df_fret)/sqrt(length(df_fret))) 
+
+ggplot(data=Akar_grouped, aes(y=avg_fret, x= time, color = Treatment, group = Treatment))+
+        geom_line()+
+        geom_ribbon(aes(ymin=avg_fret-sem_fret, ymax=avg_fret+sem_fret), linetype=0, alpha=0.1)+
+        theme_minimal() 
+
+
+```
+
+
+# Clustering
+```{r}
+# For clustering analysis subset cells with medium sized round nuclei
+
+akar_MSN <- akar_complete %>% filter(Nuclear_roundness == "Round",
+                          Nuclear_size == "Medium")
+
+# Clustering
+
+dat <- akar_MSN %>%
+  mutate(cell_number = group_indices(., PlateID, WellName, rowname, Treatment),
+         cell_treatment = paste(cell_number, Treatment, sep = '_')) 
+
+# Pivot to format for clustering
+for_cluster <- dat %>%
+  select(cell_treatment, timepoint, df_fret) %>%
+  pivot_wider(names_from = timepoint, values_from = df_fret) %>%
+  drop_na()
+
+# Cluster, look here for more information on how to play 
+# around with settings https://cran.r-project.org/web/packages/dtwclust/vignettes/dtwclust.pdf
+pc <- tsclust(for_cluster[,2:5], type = 'partitional', k = 4, distance = 'Euclidean', 
+              centroid = 'pam', seed = 26, trace = T)
+
+# Make column with cluster assigned to each cell
+clustered <- for_cluster %>%
+  mutate(cluster = pc@cluster) %>%
+  select(cell_treatment, cluster)
+
+# Add cluster column to original data frame 
+dat_cluster <- dat %>%
+  left_join(clustered, by = 'cell_treatment') %>%
+  mutate(cluster = factor(cluster)) %>%
+  drop_na()
+
+```
+
+```{r}
+# Plot cluster means and assign cluster names
+dat_cluster <- dat_cluster %>%
+        mutate(Response = ifelse(cluster == 3, "Med",
+                                ifelse(cluster == 2, "Low",
+                                       ifelse(cluster == 1, "High",
+                                              ifelse(cluster == 4, "None", NA)))))
+
+dat_cluster$Response <- factor(dat_cluster$Response, levels = c("None", "Low", "Med", "High"))
+dat_cluster <- dat_cluster[order(dat_cluster$Response),]
+
+akar_dmso <- dat_cluster%>%
+  arrange(Treatment, Response)
+
+cluster_cols <- c("#BDD7E7", "#FCAE91", "#FB6A4A", "#CB181D")
+
+# Plot graph
+ggline(dat_cluster, x = 'timepoint', y = 'df_fret', facet.by = c('Treatment'), add = 'mean_se',
+       color = 'Response', palette = cluster_cols, ggtheme = theme_classic())
+
+
+```
+
+
+```{r fig.width = 6, fig.height = 7}
+#plot heatmaps
+
+akar_dmso <- dat_cluster %>%  arrange(Treatment, Response)
+
+
+akar_dmso_dmso <- akar_dmso %>% filter(Treatment == "DMSO")%>%
+  mutate(ID = paste(Identifier, rowname, sep="-"),
+         ID2 = paste(Response, cell_number, sep="."))%>%
+  group_by(rowname)
+
+akar_dmso_skf <- akar_dmso %>% filter(Treatment == "SKF")%>%
+  mutate(ID = paste(Identifier, rowname, sep="-"),
+         ID2 = paste(Response, cell_number, sep="."))%>%
+  group_by(rowname)
+
+
+akar_dmso_fsk <- akar_dmso %>% filter(Treatment == "FSK")%>%
+  mutate(ID = paste(Identifier, rowname, sep="-"),
+         ID2 = paste(Response, cell_number, sep="."))%>%
+  group_by(rowname)
+
+p_dmso <- ggplot(data=akar_dmso_dmso, aes(y = ID2, x= timepoint, fill=df_fret))+
+  geom_tile()+
+  scale_fill_gradient2(high = "red", mid = "white", low = "blue", limits = c(-20,60))+
+  theme(axis.title.y = element_blank(),
+          axis.text.y =element_text(size = 0),
+        axis.ticks.y=element_blank())+
+  labs(x = "Time (min)", title = "DMSO")
+
+
+p_skf <- ggplot(data=akar_dmso_skf, aes(y = ID2, x= timepoint, fill=df_fret))+
+  geom_tile()+
+  scale_fill_gradient2(high = "red", mid = "white", low = "blue", limits = c(-20,60))+
+  theme(axis.title.y = element_blank(),
+        axis.text.y =element_text(size = 0),
+        axis.ticks.y=element_blank())+
+  labs(x = "Time (min)", title = "SKF")
+
+
+p_fsk <- ggplot(data=akar_dmso_fsk, aes(y = ID2, x= timepoint, fill=df_fret))+
+  geom_tile()+
+  scale_fill_gradient2(high = "red", mid = "white", low = "blue", limits = c(-20,60))+
+  theme(axis.text.y =element_text(size = 0),
+        axis.title.y = element_blank(),
+        axis.ticks.y=element_blank())+
+  labs(x = "Time (min)", title = "FSK")
+
+
+grid.arrange(p_dmso, p_skf, p_fsk, ncol=3)
+```
+
+
+#PLot response rates
+```{r fig.width = 4, fig.height = 5}
+##Calculate Time means for clustered data
+
+cluster_response <- dat_cluster %>%
+        group_by(Treatment, Response, .drop=FALSE)%>%
+        summarise(n_cells = length(df_fret)/4)%>%
+        ungroup() %>%
+        
+        group_by(Treatment)%>%
+        mutate(total = sum(n_cells),
+               percentage = 100*n_cells/total)
+
+
+my.cols2 <- brewer.pal(4, "Reds")
+
+cluster_cols <- c("#EFF3FF", "#FCAE91", "#FB6A4A", "#CB181D")
+
+ggplot(cluster_response, aes(y=percentage, x=Treatment, fill = Response)) + 
+        geom_bar(stat="identity", color="black")+
+        scale_fill_manual(values = cluster_cols)+
+        theme_classic(base_size = 15)+
+        theme(axis.text.x=element_text(size=rel(1), angle=45, vjust=0.6), axis.text.y = element_text(size=rel(1)))+
+        labs(y="Percentage of Cells", x = "", title="Response Clusters")
+```
+
+
+# Plot Response magnitudes
+```{r}
+# Calculate response magnitude of responding cells
+
+response_mag <- dat_cluster %>% 
+        filter(!Response == "None",
+               !Treatment == "DMSO")%>%
+        group_by(Treatment,time)%>%
+        summarise(n = length(df_fret),
+                  avg_fret = mean(df_fret), 
+                  sd_fret = sd(df_fret), 
+                  sem_fret = sd(df_fret)/sqrt(length(df_fret))) 
+
+drug_cols <- c("#B3CDE3", "#8C96C6", "#8856A7", "#810F7C")
+
+ggplot(data=response_mag, aes(y=avg_fret, x= time, color = Treatment, group = Treatment))+
+        geom_line(size = 1.5)+
+        geom_point(size = 3)+
+        geom_hline(yintercept = 0)+
+        scale_color_manual(values = drug_cols)+
+        scale_fill_manual(values = drug_cols)+
+        geom_ribbon(aes(ymin=avg_fret-sem_fret, ymax=avg_fret+sem_fret, fill = Treatment), linetype=3, alpha=0.2)+
+        theme_classic(base_size = 15)+
+        labs(x = "Timepoint", y = "%dF/F", title = "Response Magnitude", subtitle = "AKAR-NLS")
+
+```
+
